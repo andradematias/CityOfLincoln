@@ -14,7 +14,7 @@ module.exports.getCredentials = function () {
 module.exports.main = async function (ffCollection, vvClient, response) {
     /*Script Name:  LibAssignDesignee
      Customer:      City of Lincoln
-     Purpose:       The purpose of this process is to remove Invoice Line Items associated with an Invoice that have been selected client side.
+     Purpose:       The purpose of this web service is to assign a specific Contact Record with a specific Operational Permit.
     
      Parameters:    Operational Permit Type (String, Required)
                     Permit Fee (String, Required)
@@ -25,29 +25,55 @@ module.exports.main = async function (ffCollection, vvClient, response) {
                     [1] Message
                     [2] error array or null
                     
-     Pseudo code:   1. Call LibGenerateInvoiceLineItem to generate an Invoice Line Item for the initial permit fee.
-                    2. Send response with return array.
+     Pseudo code:   1. Call getForms to get the Contact ID from the Revision ID.
+                    2. Call getForms to find the Designee Record associated with the Contact ID and Operational Permit.
+                    3. Call getForms to find any other Designee Records with the passed in type checked.
+                    4. Marks all Designee Records with the passed in type as unchecked.
+                    5. Mark Designee Record as the assigned type.
+                    6. Send response with return array.
    
      Date of Dev: 02/15/2021
      Last Rev Date: 02/15/2021
      Revision Notes:
      02/15/2021  - Rocky Borg: Script created.
+     07/13/2022  - Matías Andrade: An additional step is added, including the cases of contact record assignments belonging to a different Operational Permit but of the same business.
    
      */
 
-    logger.info('Start of the process LibAssignDesignee at ' + Date())
+    logger.info("Start of the process LibAssignDesignee at " + Date());
 
     /**********************
      Configurable Variables
     ***********************/
     // Form Template Names
-    let contactRecordTemplateID = 'Contact Record'
-    let designeeTemplateID = 'Designee'
+    let contactRecordTemplateID = "Contact Record";
+    let designeeTemplateID = "Designee";
 
     // Response array populated in try or catch block, used in response sent in finally block.
-    let outputCollection = []
+    let outputCollection = [];
     // Array for capturing error messages that may occur within helper functions.
-    let errorLog = []
+    let errorLog = [];
+
+    /****************
+    Helper Functions
+    *****************/
+    // Check if field object has a value property and that value is truthy before returning value.
+    function getFieldValueByName(fieldName, isOptional) {
+        try {
+            let fieldObj = ffCollection.getFormFieldByName(fieldName)
+            let fieldValue = fieldObj && (fieldObj.hasOwnProperty('value') ? fieldObj.value : null)
+
+            if (fieldValue === null) {
+                throw new Error(`A value property for ${fieldName} was not found.`)
+            }
+            if (!isOptional && !fieldValue) {
+                throw new Error(`A value for ${fieldName} was not provided.`)
+            }
+            return fieldValue
+        } catch (error) {
+            errorLog.push(error.message)
+        }
+    }
 
     try {
         /*********************
@@ -64,57 +90,46 @@ module.exports.main = async function (ffCollection, vvClient, response) {
             throw new Error(`Please provide a value for the required fields.`)
         }
 
-
-        /****************
-         Helper Functions
-        *****************/
-        // Check if field object has a value property and that value is truthy before returning value.
-        function getFieldValueByName(fieldName, isOptional) {
-            try {
-                let fieldObj = ffCollection.getFormFieldByName(fieldName)
-                let fieldValue = fieldObj && (fieldObj.hasOwnProperty('value') ? fieldObj.value : null)
-
-                if (fieldValue === null) {
-                    throw new Error(`A value property for ${fieldName} was not found.`)
-                }
-                if (!isOptional && !fieldValue) {
-                    throw new Error(`A value for ${fieldName} was not provided.`)
-                }
-                return fieldValue
-            } catch (error) {
-                errorLog.push(error.message)
-            }
-        }
-
-
         /****************
          BEGIN ASYNC CODE
         *****************/
+
         // STEP 1 - Call getForms to get the Contact ID from the Revision ID.
-        let queryParams = {
-            q: `[revisionId] eq '${ContactRevisionID}'`,
-            fields: 'revisionId, instanceName'
+        let contactID = '';
+
+        if (ContactRevisionID) {
+
+            let queryParams = {
+                q: `[revisionId] eq '${ContactRevisionID}'`,
+                fields: 'revisionId, instanceName'
+            }
+
+            let getFormsResp = await vvClient.forms.getForms(queryParams, contactRecordTemplateID)
+            getFormsResp = JSON.parse(getFormsResp)
+            let getFormsData = (getFormsResp.hasOwnProperty('data') ? getFormsResp.data : null);
+            let getFormsLength = (Array.isArray(getFormsData) ? getFormsData.length : 0)
+
+            if (getFormsResp.meta.status !== 200) {
+                throw new Error(`Error encountered when calling getForms. ${getFormsResp.meta.statusMsg}.`)
+            }
+            if (!getFormsData || !Array.isArray(getFormsData)) {
+                throw new Error(`Data was not returned when calling getForms.`)
+            }
+            if (getFormsData[0]['instanceName']) {
+                contactID = getFormsData[0]['instanceName']
+            }
         }
 
-        let getFormsResp = await vvClient.forms.getForms(queryParams, contactRecordTemplateID)
-        getFormsResp = JSON.parse(getFormsResp)
-        let getFormsData = (getFormsResp.hasOwnProperty('data') ? getFormsResp.data : null);
-        let getFormsLength = (Array.isArray(getFormsData) ? getFormsData.length : 0)
-
-        if (getFormsResp.meta.status !== 200) {
-            throw new Error(`Error encountered when calling getForms. ${getFormsResp.meta.statusMsg}.`)
+        if (contactID == '') {
+            let InstanceName = getFieldValueByName('Instance Name')
+            contactID = InstanceName
         }
-        if (!getFormsData || !Array.isArray(getFormsData)) {
-            throw new Error(`Data was not returned when calling getForms.`)
-        }
-
-        let contactID = getFormsData[0]['instanceName']
 
 
         //STEP 2 - Call getForms to find the Designee Record associated with the Contact ID and Operational Permit.
         let queryDesigneeParams = {
             q: `[Contact ID] eq '${contactID}' AND [Operational Permit ID] eq '${OperationalPermitID}'`,
-            fields: 'revisionId, instanceName'
+            expand: true
         }
 
         let getFormsDesigneeResp = await vvClient.forms.getForms(queryDesigneeParams, designeeTemplateID)
@@ -125,12 +140,37 @@ module.exports.main = async function (ffCollection, vvClient, response) {
         if (getFormsDesigneeResp.meta.status !== 200) {
             throw new Error(`Error encountered when calling getForms. ${getFormsDesigneeResp.meta.statusMsg}.`)
         }
+
         if (!getFormsDesigneeData || !Array.isArray(getFormsDesigneeData)) {
             throw new Error(`Data was not returned when calling getForms.`)
         }
 
-        let designeeGUID = getFormsDesigneeData[0]['revisionId']
+        let designeeGUID;
+        let BusinessID;
+        if (getFormsDesigneeLength > 0) {
+            designeeGUID = getFormsDesigneeData[0]['revisionId']
+            BusinessID = getFormsDesigneeData[0]['business ID']
+        } else {
+            //If the Designee Record associated with the Contact ID and Operational Permit is not found, a designee is created that relates to the Contact ID and Operational Permit
+            const newFormTemplateName = "Designee";
+            const postDesigneeParams = {
+                DesigneeType: "False",
+                "Contact ID": contactID,
+                "Business ID": BusinessID,
+                "Operational Permit ID": OperationalPermitID,
+                Status: "Active",
+                "Form Saved": "True",
+            };
 
+            let postResp = await vvClient.forms.postForms(null, postDesigneeParams, newFormTemplateName)
+
+            if (postResp.meta.status === 201 || postResp.meta.status === 200) {
+                designeeGUID = postResp.data.revisionId;
+            }
+            else {
+                throw new Error("Call to post new form returned with an error. The server returned a status of " + postResp.meta.status);
+            }
+        }
 
         // STEP 3 - Call getForms to find any other Designee Records with the passed in type checked.
         let queryDesigneeTypeParams = {
@@ -152,19 +192,16 @@ module.exports.main = async function (ffCollection, vvClient, response) {
 
 
         // STEP 4 - Marks all Designee Records with the passed in type as unchecked.
-        if (getFormsDesigneeTypeLength) {
 
-            for (const designee of getFormsDesigneeTypeData) {
-                let formUpdateObj = {}
+        for (const designee of getFormsDesigneeTypeData) {
+            let formUpdateObj = {}
 
-                formUpdateObj[DesigneeType] = 'false'
+            formUpdateObj[DesigneeType] = 'false'
 
-                let postFormResp = await vvClient.forms.postFormRevision(null, formUpdateObj, designeeTemplateID, designee['revisionId'])
-                if (postFormResp.meta.status !== 201) {
-                    throw new Error(`An error was encountered when attempting to update the ${designeeTemplateID} form. ${postFormResp.hasOwnProperty('meta') ? postFormResp.meta.statusMsg : postFormResp.message}`)
-                }
+            let postFormResp = await vvClient.forms.postFormRevision(null, formUpdateObj, designeeTemplateID, designee['revisionId'])
+            if (postFormResp.meta.status !== 201) {
+                throw new Error(`An error was encountered when attempting to update the ${designeeTemplateID} form. ${postFormResp.hasOwnProperty('meta') ? postFormResp.meta.statusMsg : postFormResp.message}`)
             }
-
         }
 
         // STEP 5 - Mark Designee Record as the assigned type.
@@ -177,7 +214,7 @@ module.exports.main = async function (ffCollection, vvClient, response) {
             throw new Error(`An error was encountered when attempting to update the ${designeeTemplateID} form. ${postFormResp.hasOwnProperty('meta') ? postFormResp.meta.statusMsg : postFormResp.message}`)
         }
 
-        // STEP 5 - Send response with return array.
+        // STEP 6 - Send response with return array.
         outputCollection[0] = 'Success'
         outputCollection[1] = 'Designee Assigned.'
         outputCollection[2] = null
